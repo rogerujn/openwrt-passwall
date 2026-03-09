@@ -1,0 +1,135 @@
+name: Build PassWall for ImmortalWrt SNAPSHOT
+
+# 触发方式：手动触发（推荐）/ 代码推送
+on:
+  workflow_dispatch:
+    inputs:
+      target_arch:
+        description: '目标架构（如 x86_64/armvirt-64/mipsel_24kc）'
+        required: true
+        default: 'x86_64'
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/**'
+
+env:
+  # 核心配置（新PassWall仓库 + ImmortalWrt最新源码）
+  PASSWALL_REPO: "https://github.com/Openwrt-Passwall/openwrt-passwall.git"
+  PASSWALL_PACKAGES_REPO: "https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git"
+  IMMORTALWRT_REPO: "https://github.com/immortalwrt/immortalwrt.git"
+  IMMORTALWRT_BRANCH: "master"  # 拉取最新master分支（SNAPSHOT）
+
+jobs:
+  build-passwall:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: 系统环境初始化
+        run: |
+          # 更新系统并安装编译依赖
+          sudo apt update && sudo apt full-upgrade -y
+          sudo apt install -y build-essential libncurses5-dev libncursesw5-dev \
+            zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 \
+            python3-pip rsync curl flex bison ccache automake libtool binutils-dev \
+            bc patch qemu-utils swig file libelf-dev
+          # 清理缓存（避免冲突）
+          sudo apt clean && sudo rm -rf /var/lib/apt/lists/*
+
+      - name: 克隆ImmortalWrt最新源码
+        run: |
+          # 深度克隆最新master分支（仅拉取最新提交，加速）
+          git clone --depth 1 --branch ${IMMORTALWRT_BRANCH} ${IMMORTALWRT_REPO} immortalwrt
+          cd immortalwrt
+          # 打印当前源码Commit（便于追溯）
+          echo "ImmortalWrt 最新Commit: $(git rev-parse --short HEAD)"
+          # 更新基础feeds
+          ./scripts/feeds update -a
+
+      - name: 配置新PassWall仓库及依赖
+        run: |
+          cd immortalwrt
+          # 移除旧PassWall feeds配置（如有）
+          sed -i '/passwall/d' feeds.conf.default
+          # 添加新PassWall仓库地址
+          echo "src-git passwall ${PASSWALL_REPO}" >> feeds.conf.default
+          echo "src-git passwall_packages ${PASSWALL_PACKAGES_REPO}" >> feeds.conf.default
+          # 更新PassWall feeds并安装所有依赖
+          ./scripts/feeds update passwall passwall_packages
+          ./scripts/feeds install -a -p passwall
+          ./scripts/feeds install -a -p passwall_packages
+
+      - name: 配置编译参数（适配指定架构）
+        run: |
+          cd immortalwrt
+          # 根据输入的架构配置编译目标
+          case "${{ github.event.inputs.target_arch }}" in
+            x86_64)
+              echo "CONFIG_TARGET_x86=y" >> .config
+              echo "CONFIG_TARGET_x86_64=y" >> .config
+              echo "CONFIG_TARGET_x86_64_Default=y" >> .config
+              ;;
+            armvirt-64)
+              echo "CONFIG_TARGET_armvirt=y" >> .config
+              echo "CONFIG_TARGET_armvirt_64=y" >> .config
+              echo "CONFIG_TARGET_armvirt_64_Default=y" >> .config
+              ;;
+            mipsel_24kc)
+              echo "CONFIG_TARGET_ramips=y" >> .config
+              echo "CONFIG_TARGET_ramips_mt7620=y" >> .config
+              echo "CONFIG_TARGET_ramips_mt7620_Default=y" >> .config
+              ;;
+            *)
+              echo "不支持的架构: ${{ github.event.inputs.target_arch }}"
+              exit 1
+              ;;
+          esac
+          # 启用PassWall及中文语言包
+          echo "CONFIG_PACKAGE_luci-app-passwall=y" >> .config
+          echo "CONFIG_PACKAGE_luci-i18n-passwall-zh-cn=y" >> .config
+          # 禁用全量编译（仅编译PassWall相关，加速）
+          echo "CONFIG_ALL_KMODS=n" >> .config
+          echo "CONFIG_ALL_NONSHARED=n" >> .config
+          echo "CONFIG_ALL_PACKAGES=n" >> .config
+          # 生成最终编译配置
+          make defconfig
+
+      - name: 编译PassWall插件（单线程保证稳定）
+        run: |
+          cd immortalwrt
+          # 编译PassWall主插件（SNAPSHOT推荐单线程）
+          make package/luci-app-passwall/compile V=s -j1
+          # 编译核心依赖（多线程加速）
+          make package/passwall-deps/compile V=s -j$(nproc)
+
+      - name: 收集编译产物
+        run: |
+          mkdir -p passwall-ipk
+          # 复制所有PassWall相关IPK包
+          find immortalwrt/bin/packages -name "luci-app-passwall*" -exec cp {} passwall-ipk/ \;
+          find immortalwrt/bin/packages -name "passwall*" -exec cp {} passwall-ipk/ \;
+          find immortalwrt/bin/packages -name "xray*" -o -name "v2ray*" -o -name "sing-box*" -exec cp {} passwall-ipk/ \;
+          # 打印产物列表（验证编译结果）
+          echo "编译产物列表："
+          ls -lh passwall-ipk/
+
+      - name: 上传产物到GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: passwall-immortalwrt-${{ github.event.inputs.target_arch }}-latest
+          path: passwall-ipk/
+
+      - name: （可选）上传到GitHub Releases
+        uses: softprops/action-gh-release@v1
+        with:
+          files: passwall-ipk/*.ipk
+          tag_name: immortalwrt-snapshot-latest-${{ github.run_id }}
+          name: PassWall-${{ github.event.inputs.target_arch }} (ImmortalWrt-Latest)
+          body: |
+            适配ImmortalWrt SNAPSHOT（最新master源码）的PassWall插件
+            架构：${{ github.event.inputs.target_arch }}
+            编译时间：${{ github.run_started_at }}
+            ImmortalWrt最新Commit: $(cd immortalwrt && git rev-parse --short HEAD)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
