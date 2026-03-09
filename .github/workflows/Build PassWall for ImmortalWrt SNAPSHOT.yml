@@ -17,6 +17,8 @@ env:
   PASSWALL_PACKAGES_REPO: "https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git"
   IMMORTALWRT_REPO: "https://github.com/immortalwrt/immortalwrt.git"
   IMMORTALWRT_BRANCH: "master"
+  # 统一工作目录（避免路径错误）
+  WORK_DIR: "/home/runner/work/openwrt-passwall/openwrt-passwall/immortalwrt"
 
 jobs:
   build-passwall:
@@ -24,15 +26,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 清理残留目录（核心修复）
+      - name: 清理残留目录
         run: |
-          # 删除旧的immortalwrt目录（避免克隆冲突）
           rm -rf ./immortalwrt
-          # 确保工作目录干净
           ls -la
 
-      - name: 精简系统环境初始化
+      - name: 完整环境初始化（补全所有工具链）
         run: |
+          # 更新源并安装全量编译工具+系统级openssl
           sudo apt update -y
           sudo apt install -y --no-install-recommends \
             build-essential libncurses5-dev libncursesw5-dev \
@@ -40,19 +41,23 @@ jobs:
             python3-pip rsync curl flex bison ccache automake libtool binutils-dev \
             bc patch qemu-utils swig file libelf-dev libdeflate-dev \
             ruby lm-sensors libpam0g-dev libtirpc-dev libgpiod-dev libsnmp-dev \
-            policycoreutils libsepol-dev libselinux1-dev
-          # 提前创建目录并设置软链接
-          mkdir -p /home/runner/work/openwrt-passwall/openwrt-passwall/immortalwrt/staging_dir/host/bin || true
-          sudo ln -s /usr/bin/gzip /home/runner/work/openwrt-passwall/openwrt-passwall/immortalwrt/staging_dir/host/bin/libdeflate-gzip || true
+            policycoreutils libsepol-dev libselinux1-dev openssl
+          # 提前创建完整目录结构
+          mkdir -p ${WORK_DIR}/staging_dir/host/bin
+          # 1. 修复libdeflate-gzip（使用系统gzip替代）
+          sudo ln -sf /usr/bin/gzip ${WORK_DIR}/staging_dir/host/bin/libdeflate-gzip
+          # 2. 修复openssl（使用系统openssl替代）
+          sudo ln -sf /usr/bin/openssl ${WORK_DIR}/staging_dir/host/bin/openssl
+          # 验证软链接
+          ls -la ${WORK_DIR}/staging_dir/host/bin/
           sudo apt clean && sudo rm -rf /var/lib/apt/lists/*
 
-      - name: 克隆ImmortalWrt最新源码（防冲突）
+      - name: 克隆ImmortalWrt最新源码
         run: |
-          # 强制克隆（即使目录存在也覆盖，双重保障）
           git clone --depth 1 --branch ${IMMORTALWRT_BRANCH} ${IMMORTALWRT_REPO} immortalwrt || (rm -rf immortalwrt && git clone --depth 1 --branch ${IMMORTALWRT_BRANCH} ${IMMORTALWRT_REPO} immortalwrt)
           cd immortalwrt
           echo "ImmortalWrt 最新Commit: $(git rev-parse --short HEAD)"
-          # 更新并安装所有feeds
+          # 更新feeds并安装
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -75,6 +80,7 @@ jobs:
           fi
           echo "当前编译架构: ${TARGET_ARCH}"
 
+          # 架构配置
           case "${TARGET_ARCH}" in
             x86_64)
               echo "CONFIG_TARGET_x86=y" >> .config
@@ -113,18 +119,28 @@ jobs:
           echo "CONFIG_ALL_KMODS=n" >> .config
           echo "CONFIG_ALL_NONSHARED=n" >> .config
           echo "CONFIG_ALL_PACKAGES=n" >> .config
+          # 生成配置
           make defconfig
 
-      - name: 预编译基础依赖
+      - name: 预编译基础工具链（核心修复）
         run: |
           cd immortalwrt
+          # 先编译host端基础工具（openssl/lua依赖）
+          make tools/openssl/compile V=s -j$(nproc)
+          make tools/gzip/compile V=s -j$(nproc)
+          # 重新创建软链接（确保生效）
+          ln -sf /usr/bin/gzip ${WORK_DIR}/staging_dir/host/bin/libdeflate-gzip
+          ln -sf /usr/bin/openssl ${WORK_DIR}/staging_dir/host/bin/openssl
+          # 编译lua和luci-base
           make package/utils/lua/compile V=s -j$(nproc)
           make package/feeds/luci/luci-base/compile V=s -j$(nproc)
 
       - name: 编译PassWall插件
         run: |
           cd immortalwrt
+          # 单线程编译PassWall保证稳定
           make package/luci-app-passwall/compile V=s -j1
+          # 多线程编译依赖
           make package/passwall-deps/compile V=s -j$(nproc)
 
       - name: 收集编译产物
