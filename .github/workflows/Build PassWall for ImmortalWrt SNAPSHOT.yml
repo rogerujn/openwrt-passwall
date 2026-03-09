@@ -1,4 +1,4 @@
-name: Build PassWall for ImmortalWrt SNAPSHOT
+name: Build PassWall for ImmortalWrt SNAPSHOT (Latest Source)
 
 on:
   workflow_dispatch:
@@ -24,17 +24,21 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 系统环境深度初始化（修复核心依赖）
+      - name: 精简系统环境初始化（修复包名+跳过全量升级）
         run: |
-          # 更新系统并安装全量编译依赖
-          sudo apt update && sudo apt full-upgrade -y
-          sudo apt install -y build-essential libncurses5-dev libncursesw5-dev \
+          # 仅更新源，跳过全量系统升级（避免Firefox等无关包下载）
+          sudo apt update -y
+          # 安装编译必需依赖（修复libnetsnmp-dev→libsnmp-dev）
+          sudo apt install -y --no-install-recommends \
+            build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget unzip python3 \
             python3-pip rsync curl flex bison ccache automake libtool binutils-dev \
             bc patch qemu-utils swig file libelf-dev libdeflate-dev \
-            ruby lm-sensors libpam0g-dev libtirpc-dev libgpiod-dev libnetsnmp-dev \
+            ruby lm-sensors libpam0g-dev libtirpc-dev libgpiod-dev libsnmp-dev \
             policycoreutils libsepol-dev libselinux1-dev
-          # 手动安装 libdeflate-gzip（修复解压工具缺失）
+          # 提前创建immortalwrt目录，避免软链接失败
+          mkdir -p /home/runner/work/openwrt-passwall/openwrt-passwall/immortalwrt/staging_dir/host/bin
+          # 手动创建libdeflate-gzip软链接（修复解压工具缺失）
           sudo ln -s /usr/bin/gzip /home/runner/work/openwrt-passwall/openwrt-passwall/immortalwrt/staging_dir/host/bin/libdeflate-gzip || true
           # 清理缓存
           sudo apt clean && sudo rm -rf /var/lib/apt/lists/*
